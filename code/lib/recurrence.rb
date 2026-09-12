@@ -48,7 +48,7 @@ module Recurrence
 
   # Detects recurring streams for a given user up to/at request_date
   def self.detect(user_id, request_date, events, profile)
-    user_events = events.select { |e| e['user_id'] == user_id }
+    user_events = events.select { |e| e['user_id'] == user_id && !e['amount'].nil? && !e['amount'].to_s.strip.empty? }
     streams = []
 
     # 1. Detect salary income stream

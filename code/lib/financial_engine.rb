@@ -33,6 +33,7 @@ module FinancialEngine
     :start_balance,
     :min_balance,
     :amount_safe_to_pay,
+    :affordability_status,
     :earliest_date_for_full_payment,
     :daily_balances,
     :recurring_streams,
@@ -106,7 +107,7 @@ module FinancialEngine
     end
 
     # Recurrence streams
-    streams = Recurrence.detect(user_id, req_date, events, profile)
+    streams = Recurrence.detect(user_id, req_date, user_events, profile)
 
     # Build daily net cash flows for the 90-day window [req_date, req_date + 90]
     daily_flow = Hash.new(Money::ZERO)
@@ -210,6 +211,10 @@ module FinancialEngine
       end
     end
 
+    affordability_status = determine_affordability_status(
+      request, profile, amount_safe_to_pay, earliest_date
+    )
+
     ForecastResult.new(
       request_id: request['request_id'],
       user_id: user_id,
@@ -218,10 +223,60 @@ module FinancialEngine
       start_balance: start_bal,
       min_balance: min_bal,
       amount_safe_to_pay: amount_safe_to_pay,
+      affordability_status: affordability_status,
       earliest_date_for_full_payment: earliest_date,
       daily_balances: daily_balances,
       recurring_streams: streams,
       extraction_warnings: extraction_warnings
     )
+  end
+
+  # Determines affordability_status from financial capacity and profile preferences:
+  # - affordable_now: full amount is safe on request_date and user accepts full_payment
+  # - affordable_with_plan: verified valid path to complete request safely (in Stage 4,
+  #     verified partial payment where allows_partial, user accepts partial_payment,
+  #     0 < amount_safe_to_pay < requested_amount, and earliest_date_for_full_payment <= desired_completion_date)
+  # - affordable_later: full amount is expected to become safe later (on or before desired_completion_date).
+  #     Note: whether user accepts full_payment governs recommendation of 'wait' in Stage 5,
+  #     not the underlying affordability_status.
+  # - not_affordable: full payment cannot safely complete the request by desired_completion_date
+  #     and no verified plan exists at Stage 4.
+  #     (Stage 5 will evaluate seller installment options and spending changes to discover plans).
+  def self.determine_affordability_status(request, profile, amount_safe_to_pay, earliest_date)
+    req_amt = Money.parse(request['requested_amount'])
+    req_date = Date.parse(request['request_date'].to_s)
+    desired_raw = request['desired_completion_date']
+    desired_date = (desired_raw && !desired_raw.to_s.strip.empty?) ? Date.parse(desired_raw.to_s) : nil
+
+    considered_methods = (profile['payment_methods_user_will_consider'] || '')
+      .split('|')
+      .map(&:strip)
+
+    allows_partial = request['allows_partial_payment'].to_s.strip.downcase == 'true'
+
+    # 1. affordable_now: full amount is safe to pay on request_date AND user accepts full_payment
+    if amount_safe_to_pay >= req_amt && considered_methods.include?('full_payment')
+      'affordable_now'
+
+    # 2. affordable_with_plan: only when an actual verified plan path exists at Stage 4.
+    #    Partial payment is verified if permitted, accepted, 0 < safe < requested, and completes by deadline.
+    elsif allows_partial &&
+          considered_methods.include?('partial_payment') &&
+          amount_safe_to_pay > Money::ZERO &&
+          amount_safe_to_pay < req_amt &&
+          !earliest_date.nil? &&
+          (desired_date.nil? || earliest_date <= desired_date)
+      'affordable_with_plan'
+
+    # 3. affordable_later: the full amount is expected to become safe later
+    #    (on or before desired completion date).
+    #    Separated from payment method preference (which governs 'wait' in Stage 5).
+    elsif !earliest_date.nil? && earliest_date > req_date && (desired_date.nil? || earliest_date <= desired_date)
+      'affordable_later'
+
+    # 4. not_affordable: no safe full payment or verified plan path exists within deadline at Stage 4.
+    else
+      'not_affordable'
+    end
   end
 end
