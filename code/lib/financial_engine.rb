@@ -38,6 +38,7 @@ module FinancialEngine
     :daily_balances,
     :recurring_streams,
     :extraction_warnings,   # Array<String> — one entry per unresolved blank-amount event
+    :message_facts,         # Array<MessageFactExtractor::Fact> — Stage 6 validated facts
     keyword_init: true
   )
 
@@ -45,7 +46,9 @@ module FinancialEngine
   #
   # extraction_cache — Hash of event_id (String) => ImageAmountExtractor::ExtractionResult.
   #   Pass {} (the default) to get identical Stage 2 behaviour with no extraction.
-  def self.evaluate_request(request, profile, events, extraction_cache: {})
+  # message_facts — Array of MessageFactExtractor::Fact.
+  #   Pass [] (the default) to get identical Stage 2-5 behaviour with no message facts.
+  def self.evaluate_request(request, profile, events, extraction_cache: {}, message_facts: [])
     user_id = request['user_id']
     req_date = Date.parse(request['request_date'])
     req_amt = Money.parse(request['requested_amount'])
@@ -86,6 +89,42 @@ module FinancialEngine
       end
     end.compact
 
+    # Stage 6: Apply validated message facts to user events (cancellations, amendments, obligations)
+    unless message_facts.empty?
+      user_events = user_events.map do |e|
+        eid = e['event_id']
+
+        # Cancellation overrides status
+        cancel_fact = message_facts.find { |f| f.event_id == eid && (f.fact_type == 'cancellation' || f.status == 'cancelled') }
+        if cancel_fact
+          duped = e.dup
+          duped['status'] = 'cancelled'
+          next duped
+        end
+
+        # Amendment overrides amount/currency/date/status
+        amend_fact = message_facts.find { |f| f.event_id == eid && f.fact_type == 'event_amendment' }
+        if amend_fact
+          duped = e.dup
+          duped['amount'] = amend_fact.amount.to_s('F') if amend_fact.amount
+          duped['currency'] = amend_fact.currency if amend_fact.currency
+          duped['event_date'] = amend_fact.date.to_s if amend_fact.date
+          duped['status'] = amend_fact.status if amend_fact.status
+          next duped
+        end
+
+        # Payment obligation overrides failed status to pending debit
+        ob_fact = message_facts.find { |f| f.event_id == eid && f.fact_type == 'payment_obligation' }
+        if ob_fact && e['status'] == 'failed'
+          duped = e.dup
+          duped['status'] = 'pending'
+          next duped
+        end
+
+        e
+      end
+    end
+
     # Reserve pending debits (must not count pending credits/refunds)
     pending_debits = user_events.select do |e|
       e['status'] == 'pending' &&
@@ -109,6 +148,49 @@ module FinancialEngine
     # Recurrence streams
     streams = Recurrence.detect(user_id, req_date, user_events, profile)
 
+    # Stage 6: Apply validated message facts to recurring streams (salary updates/terminations)
+    unless message_facts.empty?
+      # Salary termination: suppress recurring salary
+      if message_facts.any? { |f| f.fact_type == 'salary_termination' }
+        streams.reject! { |s| s.category == 'salary' }
+      end
+
+      # Salary confirmation or update.
+      # Amending an existing detected stream is always safe.
+      # Creating a NEW salary stream (no existing one found) requires the fact to come from
+      # an employer source — free-form description text in a merchant or bank message must
+      # NOT inject new income into the cash-flow projection.
+      sal_fact = message_facts.find { |f| f.fact_type == 'salary_confirmation' || f.fact_type == 'salary_update' }
+      if sal_fact
+        sal_stream = streams.find { |s| s.category == 'salary' }
+        if sal_stream
+          # Amend the existing detected salary stream with confirmed values.
+          sal_stream.amount = sal_fact.amount if sal_fact.amount
+          sal_stream.currency = sal_fact.currency if sal_fact.currency
+          if sal_fact.date
+            sal_stream.day_of_month = sal_fact.date.day
+            sal_stream.anchor_date = sal_fact.date
+          end
+        elsif sal_fact.amount && sal_fact.source_type == 'employer'
+          # Only create a NEW salary stream from an employer-sourced message.
+          # A merchant/bank/service_provider message claiming salary must not inject income.
+          sal_date = sal_fact.date || (req_date + 15)
+          streams << Recurrence::RecurringStream.new(
+            name: 'Confirmed salary',
+            category: 'salary',
+            event_type: 'income',
+            amount: sal_fact.amount,
+            currency: sal_fact.currency || home_curr,
+            cadence: :monthly,
+            day_of_month: sal_date.day,
+            anchor_date: sal_date,
+            last_event_id: sal_fact.event_id,
+            is_income: true
+          )
+        end
+      end
+    end
+
     # Build daily net cash flows for the 90-day window [req_date, req_date + 90]
     daily_flow = Hash.new(Money::ZERO)
 
@@ -126,6 +208,44 @@ module FinancialEngine
         daily_flow[d] += amt
       else
         daily_flow[d] -= amt
+      end
+    end
+
+    # Stage 6: Add scheduled_payment message facts to daily_flow (deduplication enforced).
+    # A scheduled_payment Fact that links to an event_id already in sched_events is skipped.
+    # A Fact without an event_id is checked against sched_events by (date, amount, currency)
+    # to prevent double-counting a payment that already appears in financial_events.csv.
+    unless message_facts.empty?
+      sched_payment_facts = message_facts.select { |f| f.fact_type == 'scheduled_payment' && f.date && f.amount }
+      sched_payment_facts.each do |spf|
+        d = spf.date
+        next if d < req_date || d > req_date + 90
+
+        # Deduplication check
+        already_in_sched = if spf.event_id
+                             sched_events.any? { |se| se['event_id'] == spf.event_id }
+                           else
+                             # No event_id: guard against (date, amount_in_home_currency) match
+                             spf_amt_home = if spf.currency && spf.currency != home_curr
+                                              ExchangeRates.convert(spf.amount, spf.currency, home_curr, d)
+                                            else
+                                              spf.amount
+                                            end
+                             sched_events.any? do |se|
+                               Date.parse(se['event_date']) == d &&
+                                 Money.parse(se['amount']) == spf_amt_home &&
+                                 (se['currency'].nil? || se['currency'] == (spf.currency || home_curr))
+                             end
+                           end
+
+        next if already_in_sched
+
+        spf_amt = spf.amount
+        if spf.currency && spf.currency != home_curr
+          spf_amt = ExchangeRates.convert(spf_amt, spf.currency, home_curr, d)
+        end
+        # Scheduled payments are outgoing debits
+        daily_flow[d] -= spf_amt
       end
     end
 
@@ -227,7 +347,8 @@ module FinancialEngine
       earliest_date_for_full_payment: earliest_date,
       daily_balances: daily_balances,
       recurring_streams: streams,
-      extraction_warnings: extraction_warnings
+      extraction_warnings: extraction_warnings,
+      message_facts: message_facts
     )
   end
 
