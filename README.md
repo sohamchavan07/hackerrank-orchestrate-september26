@@ -27,7 +27,7 @@ git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.
 cd hackerrank-orchestrate-september26
 ```
 
-Build your solution in `code/main.py`, or use another language and document its entry point clearly.
+Build your solution in `code/main.rb`, or use another language and document its entry point clearly.
 
 Your solution must:
 
@@ -35,10 +35,10 @@ Your solution must:
 - Generate one prediction for every request
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Run the entry point with:
 
 ```bash
-python3 code/main.py
+ruby code/main.rb
 ```
 
 After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
@@ -115,7 +115,7 @@ For every row in `dataset/requests.csv`, produce one row in `output.csv` with:
 5. Verify deterministically — bounds, plan feasibility, schedule match, flexible-only spending changes — before writing `output.csv`.
 6. Score yourself on the solved samples, then run the full dataset.
 
-You may use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
+This implementation uses Ruby. Any language or runtime is acceptable.
 
 ---
 

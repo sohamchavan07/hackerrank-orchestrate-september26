@@ -48,7 +48,7 @@ module FinancialEngine
   #   Pass {} (the default) to get identical Stage 2 behaviour with no extraction.
   # message_facts — Array of MessageFactExtractor::Fact.
   #   Pass [] (the default) to get identical Stage 2-5 behaviour with no message facts.
-  def self.evaluate_request(request, profile, events, extraction_cache: {}, message_facts: [])
+  def self.evaluate_request(request, profile, events, extraction_cache: {}, message_facts: [], recurring_streams_override: nil)
     user_id = request['user_id']
     req_date = Date.parse(request['request_date'])
     req_amt = Money.parse(request['requested_amount'])
@@ -145,51 +145,57 @@ module FinancialEngine
       e['status'] == 'scheduled' && Date.parse(e['event_date']) >= req_date
     end
 
-    # Recurrence streams
-    streams = Recurrence.detect(user_id, req_date, user_events, profile)
+    # Recurrence streams (uses override if provided, e.g. for Stage 7 spending change evaluation)
+    streams = if recurring_streams_override
+                recurring_streams_override.map(&:dup)
+              else
+                detected = Recurrence.detect(user_id, req_date, user_events, profile)
 
-    # Stage 6: Apply validated message facts to recurring streams (salary updates/terminations)
-    unless message_facts.empty?
-      # Salary termination: suppress recurring salary
-      if message_facts.any? { |f| f.fact_type == 'salary_termination' }
-        streams.reject! { |s| s.category == 'salary' }
-      end
+                # Stage 6: Apply validated message facts to recurring streams (salary updates/terminations)
+                unless message_facts.empty?
+                  # Salary termination: suppress recurring salary
+                  if message_facts.any? { |f| f.fact_type == 'salary_termination' }
+                    detected.reject! { |s| s.category == 'salary' }
+                  end
 
-      # Salary confirmation or update.
-      # Amending an existing detected stream is always safe.
-      # Creating a NEW salary stream (no existing one found) requires the fact to come from
-      # an employer source — free-form description text in a merchant or bank message must
-      # NOT inject new income into the cash-flow projection.
-      sal_fact = message_facts.find { |f| f.fact_type == 'salary_confirmation' || f.fact_type == 'salary_update' }
-      if sal_fact
-        sal_stream = streams.find { |s| s.category == 'salary' }
-        if sal_stream
-          # Amend the existing detected salary stream with confirmed values.
-          sal_stream.amount = sal_fact.amount if sal_fact.amount
-          sal_stream.currency = sal_fact.currency if sal_fact.currency
-          if sal_fact.date
-            sal_stream.day_of_month = sal_fact.date.day
-            sal_stream.anchor_date = sal_fact.date
-          end
-        elsif sal_fact.amount && sal_fact.source_type == 'employer'
-          # Only create a NEW salary stream from an employer-sourced message.
-          # A merchant/bank/service_provider message claiming salary must not inject income.
-          sal_date = sal_fact.date || (req_date + 15)
-          streams << Recurrence::RecurringStream.new(
-            name: 'Confirmed salary',
-            category: 'salary',
-            event_type: 'income',
-            amount: sal_fact.amount,
-            currency: sal_fact.currency || home_curr,
-            cadence: :monthly,
-            day_of_month: sal_date.day,
-            anchor_date: sal_date,
-            last_event_id: sal_fact.event_id,
-            is_income: true
-          )
-        end
-      end
-    end
+                  # Salary confirmation or update.
+                  # Amending an existing detected stream is always safe.
+                  # Creating a NEW salary stream (no existing one found) requires the fact to come from
+                  # an employer source — free-form description text in a merchant or bank message must
+                  # NOT inject new income into the cash-flow projection.
+                  sal_fact = message_facts.find { |f| f.fact_type == 'salary_confirmation' || f.fact_type == 'salary_update' }
+                  if sal_fact
+                    sal_stream = detected.find { |s| s.category == 'salary' }
+                    if sal_stream
+                      # Amend the existing detected salary stream with confirmed values.
+                      sal_stream.amount = sal_fact.amount if sal_fact.amount
+                      sal_stream.currency = sal_fact.currency if sal_fact.currency
+                      if sal_fact.date
+                        sal_stream.day_of_month = sal_fact.date.day
+                        sal_stream.anchor_date = sal_fact.date
+                      end
+                    elsif sal_fact.amount && sal_fact.source_type == 'employer'
+                      # Only create a NEW salary stream from an employer-sourced message.
+                      # A merchant/bank/service_provider message claiming salary must not inject income.
+                      sal_date = sal_fact.date || (req_date + 15)
+                      detected << Recurrence::RecurringStream.new(
+                        name: 'Confirmed salary',
+                        category: 'salary',
+                        event_type: 'income',
+                        amount: sal_fact.amount,
+                        currency: sal_fact.currency || home_curr,
+                        cadence: :monthly,
+                        day_of_month: sal_date.day,
+                        anchor_date: sal_date,
+                        last_event_id: sal_fact.event_id,
+                        is_income: true
+                      )
+                    end
+                  end
+                end
+
+                detected
+              end
 
     # Build daily net cash flows for the 90-day window [req_date, req_date + 90]
     daily_flow = Hash.new(Money::ZERO)
